@@ -18,6 +18,7 @@ Los códigos fuente están materializados como carpetas ordinarias, editables de
 | Dependencies / Formats | `Dependencies/Formats/assimp` | https://github.com/victorjosegarcia888-cpu/assimp | `ab76f8df17f8307c7a2dd07c97aae2e972bb5180` |
 | Dependencies / Math | `Dependencies/Math/Imath` | https://github.com/victorjosegarcia888-cpu/Imath | `5b39e4699b028b3bdd5b9712be2fdc24ab0efcb1` |
 | Simulation | `Simulation/AMReX-Hydro` | https://github.com/victorjosegarcia888-cpu/AMReX-Hydro | `a153304acd787205b170b0f7fd8284627e076056` |
+| Simulation | `Simulation/amrex-tutorials` | https://github.com/AMReX-Codes/amrex-tutorials | `1a73f32e10514d917333ea7a3fd54e661e232144` |
 
 ## Notas
 
