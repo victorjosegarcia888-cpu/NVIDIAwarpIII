@@ -1,0 +1,25 @@
+# Copyright Contributors to the Open Shading Language project.
+# SPDX-License-Identifier: BSD-3-Clause
+# https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
+
+dist
+build
+*~
+\#*\#
+*.pyc
+*.log
+.vscode
+.envrc
+.DS_Store
+
+# OptiX disk cache database files
+optix*cache.db*
+
+# AI coding tool directories — generated locally by .agents/setup-agent
+.claude/
+.codex/
+.cursor/
+.opencode/
+.github/copilot-instructions.md
+/specs
+/.cache

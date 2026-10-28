@@ -1,0 +1,588 @@
+# Copyright Contributors to the Open Shading Language project.
+# SPDX-License-Identifier: BSD-3-Clause
+# https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/
+
+include (CTest)
+
+# Make a build/platform/testsuite directory, and copy the master runtest.py
+# there. The rest is up to the tests themselves.
+file (MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/testsuite")
+file (COPY "${CMAKE_CURRENT_SOURCE_DIR}/testsuite/common"
+      DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/testsuite")
+add_custom_command (OUTPUT "${CMAKE_BINARY_DIR}/testsuite/runtest.py"
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${CMAKE_SOURCE_DIR}/testsuite/runtest.py"
+                        "${CMAKE_BINARY_DIR}/testsuite/runtest.py"
+                    MAIN_DEPENDENCY "${CMAKE_SOURCE_DIR}/testsuite/runtest.py")
+add_custom_target ( CopyFiles ALL DEPENDS "${CMAKE_BINARY_DIR}/testsuite/runtest.py" )
+
+
+set (OSL_TEST_BIG_TIMEOUT 800 CACHE STRING "Timeout for tests that take a long time")
+
+
+# Build a single "PYTHONPATH=..." entry suitable for a CTest ENVIRONMENT
+# property, putting prefix_dir first.
+#
+# This is how the python tests find the module: which binding backend a given
+# test run exercises is decided entirely by which directory this points at.
+# (It also means `ctest` run directly in the build tree works -- previously
+# PYTHONPATH was only ever set by the `make test` wrapper.)
+#
+# On Windows, deliberately don't append the inherited PYTHONPATH: entries are
+# separated by ';' there, which CMake would then split as a list separator
+# when this is used as a test ENVIRONMENT entry.
+function (osl_tests_pythonpath_env_entry out_var prefix_dir)
+    if (WIN32)
+        set (_pythonpath "${prefix_dir}")
+    elseif (DEFINED ENV{PYTHONPATH} AND NOT "$ENV{PYTHONPATH}" STREQUAL "")
+        set (_pythonpath "${prefix_dir}:$ENV{PYTHONPATH}")
+    else ()
+        set (_pythonpath "${prefix_dir}")
+    endif ()
+    set (${out_var} "PYTHONPATH=${_pythonpath}" PARENT_SCOPE)
+endfunction ()
+
+
+# add_one_testsuite() - set up one testsuite entry
+#
+# Usage:
+#   add_one_testsuite ( testname
+#                  testsrcdir - Current test directory in ${CMAKE_SOURCE_DIR}
+#                  testdir    - Current test sandbox in ${CMAKE_BINARY_DIR}
+#                  [ENV env1=val1 env2=val2 ... ]  - env vars to set
+#                  [COMMAND cmd...] - optional override of launch command
+#                 )
+#
+
+macro (add_one_testsuite testname testsrcdir)
+    cmake_parse_arguments (_tst "" "" "ENV;COMMAND" ${ARGN})
+    set (testsuite "${CMAKE_SOURCE_DIR}/testsuite")
+    set (testdir "${CMAKE_BINARY_DIR}/testsuite/${testname}")
+    file (MAKE_DIRECTORY "${testdir}")
+    if (NOT _tst_COMMAND)
+        set (_tst_COMMAND ${Python3_EXECUTABLE} "${testsuite}/runtest.py" ${testdir})
+        if (MSVC_IDE)
+            list (APPEND _tst_COMMAND --devenv-config $<CONFIGURATION>
+                                      --solution-path "${CMAKE_BINARY_DIR}" )
+        endif ()
+    endif ()
+    get_target_property(_oiio_inc OpenImageIO::OpenImageIO INTERFACE_INCLUDE_DIRECTORIES)
+    list (APPEND _tst_ENV
+              OpenImageIO_ROOT=${OpenImageIO_ROOT}
+              OIIO_INCLUDE_DIR=${_oiio_inc}
+              IMATH_INCLUDE_DIR=${IMATH_INCLUDES}
+              OSL_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+              OSL_BUILD_DIR=${CMAKE_BINARY_DIR}
+              OSL_TESTSUITE_ROOT=${testsuite}
+              OSL_TESTSUITE_SRC=${testsrcdir}
+              OSL_TESTSUITE_CUR=${testdir}
+         )
+
+    # We need to suppress the leak sanitizer for "texture" tests, because of a
+    # minor leak inside OIIO (140 bytes! -- inconsequential) but which we
+    # can't use the suppressions list becuase the leaks come from calls made
+    # inside JITed code for which there is not a good stack trace. Any real
+    # leaks from OIIO or its dependencies we assume will be caught by lsan on
+    # the OIIO side, where there is no JIT to complicate things.
+    if (${testname} MATCHES "^texture" OR ${testname} MATCHES "gettextureinfo")
+        list (APPEND _tst_ENV ASAN_OPTIONS=detect_leaks=0:$ENV{ASAN_OPTIONS})
+    endif ()
+
+    add_test ( NAME ${testname} COMMAND ${_tst_COMMAND} )
+    # message ("Test -- env ${_tst_ENV} cmd ${_tst_COMMAND}")
+    set_tests_properties (${testname} PROPERTIES ENVIRONMENT "${_tst_ENV}" )
+
+    # Certain tests get special labels and other properties
+    if (${testname} MATCHES "^render-")
+        # Render tests are expensive and quite well internally multithreaded,
+        # so give them long timeouts, high costs, and reserve procs.
+        set_tests_properties (${testname} PROPERTIES LABELS render
+                              PROCESSORS 4 COST 10
+                              TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
+        if (${testname} MATCHES "cpp")
+            # Render tests doing full C++ compiles are even more expensive,
+            # and cut back their procs because the compilation by external
+            # cpp is quite expensive but can't be internally parallized.
+            set_tests_properties (${testname} PROPERTIES
+                                  PROCESSORS 2 COST 20)
+        endif ()
+    endif ()
+    # Some labeling for fun
+    if (${testname} MATCHES "^texture")
+        # Texture tests are internally multithreaded, so give them 2 cores,
+        # and they are medium expensive.
+        set_tests_properties (${testname} PROPERTIES LABELS texture
+                              PROCESSORS 2 COST 4)
+    endif ()
+    if (${testname} MATCHES "noise")
+        # Noise tests are internally multithreaded, so give them 2 cores,
+        # and they are medium expensive.
+        set_tests_properties (${testname} PROPERTIES LABELS noise
+                              PROCESSORS 2 COST 4)
+    endif ()
+    if ("${testname}" MATCHES "optix")
+        set_tests_properties (${testname} PROPERTIES LABELS optix)
+        if (DEFINED ENV{OSL_TESTSUITE_OPTIX_THRESH_SCALE})
+            set_property (TEST ${testname} APPEND PROPERTY ENVIRONMENT OSL_TESTSUITE_THRESH_SCALE=$ENV{OSL_TESTSUITE_OPTIX_THRESH_SCALE})
+        endif ()
+    endif ()
+    if ("${testname}" MATCHES "optix|example-cuda")
+        # Make sure the CUDA and NVRTC runtime libraries are reachable. CTest
+        # adds the host platform's path separator for this operation.
+        if (WIN32)
+            set_property (TEST ${testname} APPEND PROPERTY
+                          ENVIRONMENT_MODIFICATION
+                          "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
+            # CUDA 13 places Windows runtime DLLs in bin/x64.
+            if (IS_DIRECTORY "${CUDAToolkit_BIN_DIR}/x64")
+                set_property (TEST ${testname} APPEND PROPERTY
+                              ENVIRONMENT_MODIFICATION
+                              "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}/x64")
+            endif ()
+        else ()
+            set_property (TEST ${testname} APPEND PROPERTY
+                          ENVIRONMENT_MODIFICATION
+                          "LD_LIBRARY_PATH=path_list_prepend:${CUDAToolkit_LIBRARY_DIR}")
+        endif ()
+    endif ()
+    if (${testname} MATCHES "-reg")
+        # These are batched shading regression tests. Some are quite
+        # long, so give them a higher cost and timeout.
+        set_tests_properties (${testname} PROPERTIES LABELS batchregression
+                              COST 15 TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
+    endif ()
+endmacro ()
+
+
+macro ( TESTSUITE )
+    cmake_parse_arguments (_ats "" "LABEL;FOUNDVAR;TESTNAME" "" ${ARGN})
+    # If there was a FOUNDVAR param specified and that variable name is
+    # not defined, mark the test as broken.
+    if (_ats_FOUNDVAR AND NOT ${_ats_FOUNDVAR})
+        set (_ats_LABEL "broken")
+    endif ()
+    set (test_all_optix $ENV{TESTSUITE_OPTIX})
+    set (test_all_batched $ENV{TESTSUITE_BATCHED})
+    set (test_all_rs_bitcode $ENV{TESTSUITE_RS_BITCODE})
+    set (test_all_cpp $ENV{TESTSUITE_CPP})
+    # Add the tests if all is well.
+    set (ALL_TEST_LIST "")
+    set (_testsuite "${CMAKE_SOURCE_DIR}/testsuite")
+    foreach (_testname ${_ats_UNPARSED_ARGUMENTS})
+        set (_testsrcdir "${_testsuite}/${_testname}")
+        if (_ats_TESTNAME)
+            set (_testname "${_ats_TESTNAME}")
+        endif ()
+        if (_ats_LABEL MATCHES "broken")
+            set (_testname "${_testname}-broken")
+        endif ()
+
+        set (ALL_TEST_LIST "${ALL_TEST_LIST} ${_testname}")
+
+        # Run the test unoptimized, unless it matches a few patterns that
+        # we don't test unoptimized (or has an OPTIMIZEONLY marker file).
+        if (NOT _testname MATCHES "optix"
+            AND NOT _testname MATCHES "render"
+            AND NOT EXISTS "${_testsrcdir}/NOSCALAR"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY")
+            add_one_testsuite ("${_testname}" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=0 )
+        endif ()
+        # Run the same test again using bitcode based free function renderer 
+        # services keeping unoptimized, unless it matches a few patterns that
+        # we don't test unoptimized (or has an OPTIMIZEONLY marker file).
+        if (NOT _testname MATCHES "optix"
+            AND NOT _testname MATCHES "render"
+            AND NOT EXISTS "${_testsrcdir}/NOSCALAR"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY"
+            AND NOT EXISTS "${_testsrcdir}/NORSBITCODE")
+            add_one_testsuite ("${_testname}.rs_bitcode" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=0 TESTSHADE_RS_BITCODE=1)
+        endif ()
+        # Run the same test again with aggressive -O2 runtime
+        # optimization, triggered by setting TESTSHADE_OPT env variable.
+        # Skip OptiX-only tests and those with a NOOPTIMIZE marker file.
+        if (NOT _testname MATCHES "optix"
+            AND NOT EXISTS "${_testsrcdir}/NOSCALAR"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+            add_one_testsuite ("${_testname}.opt" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=2 )
+        endif ()
+        # Run the same test again using bitcode based free function renderer 
+        # services keeping aggressive -O2 runtime
+        # optimization, triggered by setting TESTSHADE_OPT env variable.
+        # Skip OptiX-only tests and those with a NOOPTIMIZE marker file.
+        if (NOT _testname MATCHES "optix"
+            AND NOT _testname MATCHES "render"
+            AND NOT EXISTS "${_testsrcdir}/NOSCALAR"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE"
+            AND NOT EXISTS "${_testsrcdir}/NORSBITCODE")
+            add_one_testsuite ("${_testname}.opt.rs_bitcode" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=2 TESTSHADE_RS_BITCODE=1)
+        endif ()
+        # When building for OptiX support, also run it in OptiX mode
+        # if there is an OPTIX marker file in the directory.
+        # If an environment variable $TESTSUITE_OPTIX is nonzero, then
+        # run all tests with OptiX, even if there's no OPTIX marker.
+        if (OSL_USE_OPTIX
+            AND (EXISTS "${_testsrcdir}/OPTIX" OR test_all_optix OR _testname MATCHES "optix")
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIX"
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIX-FIXME"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION")
+            # Unoptimized
+            if (NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY"
+                AND NOT EXISTS "${_testsrcdir}/OPTIX_OPTIMIZEONLY")
+                add_one_testsuite ("${_testname}.optix" "${_testsrcdir}"
+                                   ENV TESTSHADE_OPT=0 TESTSHADE_OPTIX=1 )
+            endif ()
+            # and optimized
+            add_one_testsuite ("${_testname}.optix.opt" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=2 TESTSHADE_OPTIX=1 )
+            if (NOT EXISTS "${_testsrcdir}/NOFUSED")
+              # and fused
+              add_one_testsuite ("${_testname}.optix.fused" "${_testsrcdir}"
+                                 ENV TESTSHADE_OPT=2 TESTSHADE_OPTIX=1 TESTSHADE_FUSED=1 )
+            endif()
+        endif ()
+
+        if (OSL_BUILD_BATCHED)
+            # When building for Batched support, also run it in Batched mode
+            # if there is an BATCHED marker file in the directory.
+            # If an environment variable $TESTSUITE_BATCHED is nonzero, then
+            # run all tests in Batched mode, even if there's no BATCHED marker.
+            if ((EXISTS "${_testsrcdir}/BATCHED" OR test_all_batched OR _testname MATCHES "batched")
+                AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+                AND NOT EXISTS "${_testsrcdir}/NOBATCHED"
+                AND NOT EXISTS "${_testsrcdir}/NOBATCHED-FIXME"
+                AND NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY")
+                add_one_testsuite ("${_testname}.batched" "${_testsrcdir}"
+                                   ENV TESTSHADE_OPT=0 TESTSHADE_BATCHED=1 )
+            endif ()
+
+            if ((EXISTS "${_testsrcdir}/BATCHED" OR test_all_batched OR _testname MATCHES "batched")
+                AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+                AND NOT EXISTS "${_testsrcdir}/NOBATCHED"
+                AND NOT EXISTS "${_testsrcdir}/NOBATCHED-FIXME"
+                AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+                add_one_testsuite ("${_testname}.batched.opt" "${_testsrcdir}"
+                                   ENV TESTSHADE_OPT=2 TESTSHADE_BATCHED=1 )
+            endif ()
+
+            # When building for Batched support, optionally run a regression test
+            # if there is an BATCHED_REGRESSION marker file in the directory.
+            if ((EXISTS "${_testsrcdir}/BATCHED_REGRESSION")
+                AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+                # optimized for right now
+                add_one_testsuite ("${_testname}.regress.batched.opt" "${_testsrcdir}"
+                                   ENV TESTSHADE_OPT=2 OSL_REGRESSION_TEST=BATCHED )
+            endif ()
+            if ((EXISTS "${_testsrcdir}/BATCHED_REGRESSION")
+                AND EXISTS "${_testsrcdir}/NOOPTIMIZE")
+                # not optimized
+                add_one_testsuite ("${_testname}.regress.batched" "${_testsrcdir}"
+                                   ENV TESTSHADE_OPT=0 OSL_REGRESSION_TEST=BATCHED )
+            endif ()
+        endif ()
+
+        # if there is an RS_BITCODE marker file in the directory.
+        if ((EXISTS "${_testsrcdir}/RS_BITCODE" OR test_all_rs_bitcode)
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/RS_BITCODE_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY")
+            add_one_testsuite ("${_testname}.rsbitcode" "${_testsrcdir}"
+                                ENV TESTSHADE_OPT=0 TESTSHADE_RS_BITCODE=1 )
+        endif ()
+        if ((EXISTS "${_testsrcdir}/RS_BITCODE" OR test_all_rs_bitcode)
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/RS_BITCODE_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+            add_one_testsuite ("${_testname}.rsbitcode.opt" "${_testsrcdir}"
+                                ENV TESTSHADE_OPT=2 TESTSHADE_RS_BITCODE=1 )
+        endif ()
+
+        # if there is an RS_BITCODE_REGRESSION marker file in the directory.
+        if (EXISTS "${_testsrcdir}/RS_BITCODE_REGRESSION" OR (
+                test_all_rs_bitcode AND EXISTS "${_testsrcdir}/BATCHED_REGRESSION")
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+            # optimized for right now
+            add_one_testsuite ("${_testname}.regress.rsbitcode.opt" "${_testsrcdir}"
+                                ENV TESTSHADE_OPT=2 OSL_REGRESSION_TEST=RS_BITCODE )
+        endif ()
+
+        # Also run the test through the C++ source-generation backend
+        # (OSL_DEBUG_OUTPUT_CPP=3): emit a .cpp shader, compile it to a DSO, and
+        # execute that instead of the JIT, validated against the same reference
+        # as the JIT path. Gated by the OSL_TEST_CPP_BACKEND option (or the
+        # TESTSUITE_CPP env var, for ad-hoc runs) because compiling a DSO per
+        # group more than doubles testing time, so it's opt-in (CI variants).
+        #
+        # A test is cpp-eligible iff it actually executes a shader -- i.e. its
+        # run.py invokes testshade or testrender (this auto-skips the oslc/
+        # oslinfo/python compile- or query-only tests, which have no cpp aspect,
+        # without needing a per-test marker).  optix and batched-regression
+        # tests, and any test with an explicit NOCPP marker, are excluded.
+        # NOTE: example-* tests execute shaders via their own binaries (not
+        # testshade/testrender), so they are not auto-included here -- a known,
+        # deferred gap.
+        #
+        # Run at both opt levels like the JIT path: -O0 actually executes every
+        # shader op (so each runtime op implementation is verified), while -O2
+        # exercises the constant-folded path.
+        set (_cpp_eligible OFF)
+        if ((OSL_TEST_CPP_BACKEND OR test_all_cpp)
+            AND NOT _testname MATCHES "optix"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/NOCPP"
+            AND EXISTS "${_testsrcdir}/run.py")
+            file (STRINGS "${_testsrcdir}/run.py" _cpp_runs_shader
+                  REGEX "testshade|testrender")
+            if (_cpp_runs_shader)
+                set (_cpp_eligible ON)
+            endif ()
+        endif ()
+        if (_cpp_eligible AND NOT _testname MATCHES "render"
+            AND NOT EXISTS "${_testsrcdir}/OPTIMIZEONLY")
+            add_one_testsuite ("${_testname}.cpp" "${_testsrcdir}"
+                                ENV TESTSHADE_OPT=0 OSL_DEBUG_OUTPUT_CPP=3 )
+        endif ()
+        if (_cpp_eligible AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE")
+            add_one_testsuite ("${_testname}.cpp.opt" "${_testsrcdir}"
+                                ENV TESTSHADE_OPT=2 OSL_DEBUG_OUTPUT_CPP=3 )
+        endif ()
+
+    endforeach ()
+    message (VERBOSE "Added tests: ${ALL_TEST_LIST}")
+endmacro ()
+
+macro (osl_add_all_tests)
+    # List all the individual testsuite tests here, except those that need
+    # special installed tests.
+    TESTSUITE ( aastep allowconnect-err andor-reg and-or-not-synonyms
+                backend-cpp
+                arithmetic area area-reg arithmetic-reg
+                array array-reg array-copy array-copy-reg array-derivs array-range
+                array-aassign array-assign-reg array-length-reg
+                bitwise-and-reg bitwise-or-reg bitwise-shl-reg  bitwise-shr-reg bitwise-xor-reg
+                blackbody blackbody-reg blendmath breakcont breakcont-reg
+                bug-array-heapoffsets bug-locallifetime bug-outputinit
+                bug-param-duplicate bug-peep bug-return
+                calculatenormal-reg
+                cellnoise closure closure-array closure-layered closure-parameters closure-zero closure-conditional
+                color color2 color4 color-reg colorspace comparison
+                complement-reg compile-buffer compassign-bool compassign-reg
+                component-range compstats
+                control-flow-reg connect-components
+                const-array-params const-array-fill
+                debugnan debug-uninit
+                derivs derivs-muldiv-clobber
+                draw_string
+                error-dupes error-malformed error-serialized
+                example-deformer
+                example-batched-deformer
+                example-tinyrender
+                exit exponential
+                filterwidth-reg
+                for-reg format-reg fprintf
+                function-earlyreturn function-simple function-outputelem
+                function-overloads function-redef
+                geomath getattribute-camera getattribute-shader getattribute-shading
+                getsymbol-nonheap gettextureinfo gettextureinfo-reg
+                gettextureinfo-udim gettextureinfo-udim-reg
+                globals-needed
+                group-outputs groupdata-opt groupstring
+                hash hashnoise hex hyperb
+                ieee_fp ieee_fp-reg if if-reg incdec initlist
+                initops initops-instance-clash
+                intbits isconnected
+                isconstant
+                layers layers-Ciassign layers-entry layers-lazy layers-lazyerror
+                layers-nonlazycopy layers-repeatedoutputs
+                lazytrace
+                length-reg linearstep
+                lockgeom
+                logic loop luminance-reg
+                matrix matrix-reg matrix-arithmetic-reg
+                matrix-compref-reg max-reg message message-no-closure message-reg
+                mergeinstances-duplicate-entrylayers
+                mergeinstances-nouserdata mergeinstances-vararray
+                metadata-braces min-reg miscmath missing-shader
+                mix-reg
+                named-components
+                nestedloop-reg
+                noise noise-cell
+                noise-gabor noise-gabor2d-filter noise-gabor3d-filter
+                noise-gabor-reg
+                noise-generic
+                noise-perlin noise-simplex
+                noise-reg
+                normalize-reg
+                pnoise pnoise-cell pnoise-gabor
+                pnoise-generic pnoise-perlin
+                pnoise-reg
+                operator-overloading
+                opt-warnings
+                oslc-comma oslc-D oslc-M
+                oslc-err-arrayindex oslc-err-assignmenttypes
+                oslc-err-closuremul oslc-err-field
+                oslc-err-format oslc-err-funcoverload
+                oslc-err-intoverflow oslc-err-write-nonoutput
+                oslc-err-noreturn oslc-err-notfunc
+                oslc-err-initlist-args oslc-err-initlist-return
+                oslc-err-named-components
+                oslc-err-outputparamvararray oslc-err-paramdefault
+                oslc-err-struct-array-init oslc-err-struct-ctr
+                oslc-err-struct-dup oslc-err-struct-print
+                oslc-err-type-as-variable
+                oslc-err-unknown-ctr
+                oslc-literalfold
+                oslc-pragma-warnerr
+                oslc-warn-commainit
+                oslc-variadic-macro
+                oslc-version
+                oslinfo-arrayparams oslinfo-colorctrfloat
+                oslinfo-metadata oslinfo-noparams
+                osl-imageio
+                paramval-floatpromotion
+                pragma-nowarn
+                printf-reg
+                printf-whole-array
+                raytype raytype-reg raytype-specialized regex-reg
+                reparam reparam-arrays reparam-connected-crash reparam-string testoptix-reparam
+                render-background render-bumptest
+                render-bunny
+                render-cornell
+                render-displacement
+                render-furnace-diffuse
+                render-mx-anisotropic-vdf
+                render-mx-furnace-burley-diffuse
+                render-mx-furnace-oren-nayar
+                render-mx-furnace-sheen
+                render-mx-burley-diffuse
+                render-mx-dielectric render-mx-dielectric-glass
+                render-mx-conductor
+                render-mx-generalized-schlick render-mx-generalized-schlick-glass
+                render-mx-layer
+                render-mx-sheen
+                render-mx-medium-vdf
+                render-mx-medium-vdf-glass
+                render-microfacet render-oren-nayar
+                render-shaderball
+                render-spi-thinlayer
+                render-uv render-veachmis render-ward
+                render-raytypes
+                select select-reg shaderglobals shortcircuit
+                smoothstep-reg
+                spline spline-reg splineinverse splineinverse-ident
+                splineinverse-knots-ascend-reg splineinverse-knots-descend-reg
+                spline-boundarybug spline-derivbug
+                split-reg
+                string string-reg
+                struct struct-array struct-array-mixture
+                struct-err struct-init-copy
+                struct-isomorphic-overload struct-layers
+                struct-operator-overload struct-return struct-with-array
+                struct-nested struct-nested-assign struct-nested-deep
+                ternary
+                testshade-expr
+                test-fmt-arrays test-fmt-fileprint
+                test-fmt-cxpf  test-fmt-noise test-fmt-matrixcolor 
+                test-fmt-stpf test-fmt-errorwarning test-fmt-errorwarning-repeats
+                texture-alpha texture-alpha-derivs
+                texture-blur texture-colorspace texture-connected-options
+                texture-derivs texture-environment texture-errormsg
+                texture-environment-opts-reg
+                texture-firstchannel texture-interp
+                texture-missingalpha texture-missingcolor texture-opts-reg texture-simple
+                texture-smallderivs texture-swirl texture-udim
+                texture-width texture-withderivs texture-wrap
+                trace-reg
+                trailing-commas
+                transcendental-reg
+                transitive-assign
+                transform transform-reg transformc transformc-reg trig trig-reg
+                typecast
+                unknown-instruction
+                userdata userdata-defaults userdata-partial userdata-custom userdata-passthrough
+                vararray-connect vararray-default
+                vararray-deserialize vararray-param
+                vecctr vector vector2 vector4 vector-reg
+                wavelength_color wavelength_color-reg Werror xml xml-reg )
+
+    # Only run the ocio test if the OIIO we are using has OCIO support
+    if (OpenImageIO_HAS_OpenColorIO)
+        TESTSUITE ( ocio )
+    endif ()
+
+    # Add tests that require the Python bindings if we built them.
+    # We also exclude these tests if this is a sanitizer build, because the
+    # Python interpreter itself won't be linked with the right asan
+    # libraries to run correctly.
+    #
+    # These go through add_one_testsuite directly rather than TESTSUITE(),
+    # because they need a per-variant PYTHONPATH (which is the *only* thing
+    # that selects which binding backend a run exercises), and because none of
+    # the variants TESTSUITE() generates -- optimized, batched, rs_bitcode,
+    # optix -- mean anything for a test that never executes a shader.
+    if (USE_PYTHON AND Python3_Development_FOUND AND NOT SANITIZE)
+        set (_py_testsrc "${CMAKE_SOURCE_DIR}/testsuite/python-oslquery")
+        osl_tests_pythonpath_env_entry (_pybind_pypath
+                                        "${CMAKE_BINARY_DIR}/lib/python/site-packages")
+        if (OSL_PYTHON_BINDINGS_BACKEND STREQUAL "both")
+            # In "both" mode the nanobind module is kept in its own build-tree
+            # package so it doesn't shadow the pybind11 one, which owns
+            # lib/python/site-packages.
+            osl_tests_pythonpath_env_entry (_nb_pypath
+                                            "${CMAKE_BINARY_DIR}/lib/python/nanobind")
+        else ()
+            # nanobind-only builds put the module exactly where pybind11
+            # would have, so the same path serves.
+            set (_nb_pypath "${_pybind_pypath}")
+        endif ()
+
+        set (_nb_suffix ".nanobind")
+        if (OSL_BUILD_PYTHON_PYBIND11)
+            add_one_testsuite ("python-oslquery" "${_py_testsrc}"
+                               ENV TESTSHADE_OPT=0 "${_pybind_pypath}")
+        else ()
+            # Whichever backend is the only one built gets the plain test
+            # name; the suffix exists to disambiguate, so with nothing to
+            # disambiguate from it would just be noise.
+            set (_nb_suffix "")
+        endif ()
+        if (OSL_BUILD_PYTHON_NANOBIND)
+            add_one_testsuite ("python-oslquery${_nb_suffix}" "${_py_testsrc}"
+                               ENV TESTSHADE_OPT=0 "${_nb_pypath}")
+        endif ()
+    endif ()
+
+    # Only run openvdb-related tests if the local OIIO has openvdb support.
+    execute_process ( COMMAND ${OpenImageIO_LIB_DIR}/../bin/oiiotool --help
+                      OUTPUT_VARIABLE oiiotool_help )
+    if (oiiotool_help MATCHES "openvdb")
+        TESTSUITE ( texture3d texture3d-opts-reg )
+    endif()
+
+    # Only run pointcloud tests if Partio is found
+    if (partio_FOUND)
+        TESTSUITE ( pointcloud pointcloud-fold )
+    endif ()
+
+    # Only run the OptiX tests if OptiX and CUDA are found
+    if (OPTIX_FOUND AND CUDAToolkit_FOUND)
+        TESTSUITE ( testoptix testoptix-noise example-cuda)
+    endif ()
+
+    # Some regression tests have a lot of combinations and may need more time to finish
+    if (OSL_BUILD_BATCHED)
+        set_tests_properties (arithmetic-reg.regress.batched.opt
+                              PROPERTIES TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
+        set_tests_properties (transform-reg.regress.batched.opt
+                              PROPERTIES TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
+    endif ()
+    set_tests_properties (matrix-reg.regress.rsbitcode.opt
+                          PROPERTIES TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
+endmacro()

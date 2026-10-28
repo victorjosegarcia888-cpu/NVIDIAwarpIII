@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# Streaming variant of the CAE Editor with VTK delegate support. Combines the
+# kit_cae_streaming base (livestream + messaging + cae bundle) with the legacy
+# VTK delegate and operator commands.
+
+[package]
+title = "Omni CAE Editor Streaming (VTK)"
+version = "3.0.0"
+description = "Streaming deployment of Omni CAE Editor with VTK support"
+keywords = ["experience", "app", "dev", "streaming", "vtk"]
+template_name = "omni.streaming_configuration"
+
+[dependencies]
+"kit_cae_streaming" = {}
+
+# Legacy VTK-based extensions
+"omni.cae.delegate.vtk" = {}
+"omni.cae.vtk" = {}  # Legacy VTK extension with operator commands
+
+[settings.persistent.app.stage]
+upAxis = 'Z'
+
+[settings.app.exts]
+folders.'++' = [  # Search paths for extensions.
+	"${app}/../exts",
+    "${app}/../apps",
+	"${app}/../extscache/"
+]
+
+[settings.app.rendergraph]
+maxFramesInFlight = 2
+
+[settings.log]
+file = "logs/omni.cae_vtk_streaming.kit.log"
+fileLogLevel = "info"
+enableStandardStreamOutput = true
+outputStreamLevel = "warning"

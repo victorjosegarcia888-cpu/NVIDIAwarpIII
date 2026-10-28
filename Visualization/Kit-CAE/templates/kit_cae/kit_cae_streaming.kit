@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+[package]
+# DON'T FORGET TO REPLACE THE VERSION WITH THE KIT VERSION
+# WHEN COPYING THIS FILE TO THE KIT VERSION SUB FOLDER
+# OTHERWISE THE SYMLINKS WILL NOT WORK
+target.kit = ["{{ version }}"]
+
+[dependencies]
+"kit_base_editor" = {}
+"omni.cae.bundle" = {}
+"default_stream" = {}
+# Required for the cae-streaming skill's data-channel handlers
+# (LivestreamMessaging.observe / observe_and_dispatch + register_event_type_to_send).
+"omni.kit.livestream.messaging" = {}
+
+[settings.app.window]
+# UI hidden by default so the WebRTC stream is just the viewport. The streaming
+# kit ships with the editor chrome; this collapses it for headless deployments.
+# Override with --/app/window/hideUi=false for local debugging.
+hideUi = true
+
+[settings.app.exts]
+folders.'++' = [  # Search paths for extensions.
+	"${app}/../exts",
+    "${app}/../apps",
+	"${app}/../extscache/"
+]

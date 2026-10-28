@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) Contributors to the OpenEXR Project.
+#
+# To regenerate requirements-lock.txt (hashed deps for Scorecard Pinned-Dependencies):
+#   pip-compile requirements.txt --generate-hashes -o requirements-lock.txt
+#
+colorama==0.4.6 # necessary on Windows only
+sphinx==9.0.4
+breathe==5.1.0
+pydata-sphinx-theme==0.23.0
+sphinx-design==0.7.0
+sphinx-copybutton==0.5.2
+urllib3>=2.8.0 # transitive via requests; floor for security fixes
+idna>=3.20  # transitive via requests; floor for CVE-2026-45409 / GHSA-65pc-fj4g-8rjx

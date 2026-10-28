@@ -1,8 +1,8 @@
 # Ecosistema NVIDIA Warp
 
-Repositorios clonados por separado. Cada checkout es shallow y queda en HEAD detached, fijado al SHA completo de la tabla.
+Los códigos fuente están materializados como carpetas ordinarias, editables desde este workspace. No hay repositorios Git anidados ni gitlinks en el índice raíz. La metadata de los clones se conserva fuera de las carpetas visibles, en `.git/nested-repo-metadata/`. La tabla registra el commit de origen exacto de cada contenido.
 
-| Grupo | Carpeta | Repositorio | Commit fijado |
+| Grupo | Carpeta | Repositorio de origen | Commit de origen |
 | --- | --- | --- | --- |
 | Geometry | `Geometry/CGAL` | https://github.com/victorjosegarcia888-cpu/cgal | `9484faba7d626ca04520ff80187ef51a2becb1b1` |
 | Geometry | `Geometry/EBGeometry` | https://github.com/victorjosegarcia888-cpu/EBGeometry | `26469fc24f95967b682f25b9646e59b753dc7690` |
@@ -22,4 +22,4 @@ Repositorios clonados por separado. Cada checkout es shallow y queda en HEAD det
 ## Notas
 
 - OpenEXR está fijado en la versión 4.0.0. Su configuración busca Imath 3.1 o superior; el Imath fijado aquí declara la versión 3.2.0. Imath se mantiene una sola vez en `Dependencies/Math/Imath` y no se copia dentro de OpenEXR.
-- Warp contiene un objeto LFS ausente en el remoto (`docs/img/examples/core_dem.png`, respuesta 404). El checkout se completó omitiendo el smudge de LFS; ese archivo puede no estar disponible en `GPU/Warp`.
+- La imagen LFS `GPU/Warp/docs/img/examples/core_dem.png` se recuperó del repositorio oficial de Warp; su SHA-256 coincide con el objeto requerido.

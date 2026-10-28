@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+[package]
+title = "Omni CAE Editor Streaming"
+version = "3.0.0"
+description = "Configuration for streaming deployments of Omni CAE Editor"
+keywords = ["experience", "app", "dev", "streaming"]
+template_name = "omni.streaming_configuration"
+
+[dependencies]
+"kit_cae_streaming" = {}
+
+[settings.persistent.app.stage]
+upAxis = 'Z'
+
+[settings.app.exts]
+folders.'++' = [  # Search paths for extensions.
+	"${app}/../exts",
+    "${app}/../apps",
+	"${app}/../extscache/"
+]
+
+[settings.app.rendergraph]
+maxFramesInFlight = 2
+
+[settings.log]
+file = "logs/omni.cae_streaming.kit.log"
+fileLogLevel = "info" # more verbose logging
+enableStandardStreamOutput = true
+outputStreamLevel = "warning"

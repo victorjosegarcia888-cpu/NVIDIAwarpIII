@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+[package]
+title = "Omni CAE Editor (VTK)"
+version = "3.0.0"
+description = "Kit-CAE Sample Application with VTK"
+keywords = ["app"]
+template_name = "kit_base_editor"
+
+[dependencies]
+"kit_cae_editor" = {}
+
+[settings.persistent.app.stage]
+upAxis = 'Z'
+
+[settings.app]
+window.title = "Omni CAE Editor (with VTK) (Kit: ${kit_version_short}.${kit_version_patch})"
+
+[settings.app.exts]
+folders.'++' = [  # Search paths for extensions.
+	"${app}/../exts",
+    "${app}/../apps",
+	"${app}/../extscache/"
+]
+
+[settings.log]
+file = "logs/omni.cae_vtk.kit.log"
+fileLogLevel = "info" # more verbose logging
+enableStandardStreamOutput = true
+outputStreamLevel = "warning"

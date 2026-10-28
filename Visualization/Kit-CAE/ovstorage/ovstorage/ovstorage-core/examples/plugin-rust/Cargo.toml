@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-example-plugin-rust"
+version.workspace = true
+edition = "2024"
+description = "Example Rust plugin for ovstorage."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+async-trait = "0.1.89"
+
+[lib]
+name = "ovstorage_plugin_example_rust"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

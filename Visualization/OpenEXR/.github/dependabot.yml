@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) Contributors to the OpenEXR Project.
+
+version: 2
+
+updates:
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      # Dependabot assigns each dependency to the first group whose
+      # pattern matches, so codeql-action updates land here...
+      codeql:
+        patterns:
+          - "github/codeql-action/*"
+      # ...and everything else (actions/checkout, actions/cache,
+      # pypa/cibuildwheel, vmactions/freebsd-vm, etc.) is batched into a
+      # single PR here instead of one PR per action.
+      actions-deps:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      day: "monday"
+      interval: "weekly"
+    groups:
+      # Batch pyproject.toml build/runtime deps (scikit-build-core,
+      # pybind11, build, numpy) into a single PR instead of one per
+      # package.
+      python-module-deps:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/website"
+    schedule:
+      day: "monday"
+      interval: "weekly"
+    # Hashed lockfile is regenerated locally with pip-compile; do not let
+    # Dependabot rewrite it (transitive bumps belong in requirements.txt or
+    # a deliberate lock regen, not automated lock-only PRs).
+    exclude-paths:
+      - "website/requirements-lock.txt"
+      - "website/requirements.txt.lock"
+    groups:
+      # Batch all website doc-tooling bumps (sphinx, docutils, breathe,
+      # pydata-sphinx-theme, etc.) into a single PR instead of one per
+      # package.
+      website-deps:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      day: "monday"
+      interval: "weekly"
+
+  - package-ecosystem: "bazel"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # Batch all MODULE.bazel bumps from a given run into a single PR,
+      # instead of one PR per dependency.
+      bazel-deps:
+        patterns:
+          - "*"

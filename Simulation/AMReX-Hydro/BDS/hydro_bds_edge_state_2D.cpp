@@ -1,0 +1,843 @@
+/**
+ * \file hydro_bds_edge_state_2D.cpp
+ *
+ * \addtogroup BDS
+ *  @{
+ */
+
+#include <hydro_bds.H>
+#include <hydro_constants.H>
+
+#include <limits>
+
+using namespace amrex;
+
+// Relative tolerance used by the slope limiter. It multiplies a local state
+// scale, so that the limiter behaves the same way for a field of any magnitude.
+constexpr amrex::Real eps = Real(1e-8);
+
+/**
+ * Uses the Bell-Dawson-Shubin (BDS) algorithm, a higher order Godunov
+ * method for scalar conservation laws in two dimensions, to compute
+ * edge states.
+ *
+ * \param [in]     bx          Current grid patch
+ * \param [in]     ncomp       Number of components to work on
+ * \param [in]     q           Array4 of state, starting at component of interest
+ * \param [in,out] xedge       Array4 containing x-edges, starting at component of interest
+ * \param [in,out] yedge       Array4 containing y-edges, starting at component of interest
+ * \param [in]     umac        x-Face velocities.
+ * \param [in]     vmac        y-Face velocities.
+ * \param [in]     fq          Array4 for forces, starting at component of interest
+ * \param [in]     geom        Level geometry.
+ * \param [in]     l_dt        Time step.
+ * \param [in]     h_bcrec     Boundary conditions (host).
+ * \param [in]     pbc         Boundary conditions (device).
+ * \param [in]     iconserv    Indicates conservative dimensions.
+ * \param [in]     is_velocity Indicates a component is velocity so boundary conditions can
+ *                             be properly addressed. The header hydro_constants.H
+ *                             defines the component position by [XY]VEL macro.
+ *
+ */
+
+void
+BDS::ComputeEdgeState ( Box const& bx, int ncomp,
+                        Array4<Real const> const& q,
+                        Array4<Real      > const& xedge,
+                        Array4<Real      > const& yedge,
+                        Array4<Real const> const& umac,
+                        Array4<Real const> const& vmac,
+                        Array4<Real const> const& divu,
+                        Array4<Real const> const& fq,
+                        Geometry geom,
+                        Real l_dt,
+                        Vector<BCRec> const& h_bcrec,
+                        BCRec const* pbc,
+                        int const* iconserv,
+                        bool is_velocity,
+                        bool allow_inflow_on_outflow)
+{
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(geom.IsCartesian() || geom.IsRZ(),
+        "BDS::ComputeEdgeState: only Cartesian and RZ coordinates are supported");
+
+    // For now, loop on components here
+    for( int icomp = 0; icomp < ncomp; ++icomp)
+    {
+        // Temporary slope container per components
+        Box const& bxg1 = amrex::grow(bx,1);
+        FArrayBox slopefab(bxg1,3,The_Async_Arena());
+
+        BDS::ComputeSlopes(bx, geom, icomp,
+                           q, slopefab.array(),
+                           h_bcrec);
+
+        BDS::ComputeConc(bx, geom, icomp,
+                         q, xedge, yedge, slopefab.array(),
+                         umac, vmac, divu, fq,
+                         iconserv,
+                         l_dt, h_bcrec, pbc,
+                         is_velocity, allow_inflow_on_outflow);
+    }
+}
+
+/**
+ * Compute bilinear slopes for BDS algorithm.
+ *
+ * \param [in]  bx      Current grid patch
+ * \param [in]  geom    Level geometry.
+ * \param [in]  icomp   Component of the state Array4.
+ * \param [in]  s       Array4<const> of state vector.
+ * \param [out] slopes  Array4 to store slope information.
+ * \param [in]  h_bcrec Boundary conditions (host).
+ *
+ */
+
+void
+BDS::ComputeSlopes ( Box const& bx,
+                     const Geometry& geom,
+                     int icomp,
+                     Array4<Real const> const& s,
+                     Array4<Real      > const& slopes,
+                     Vector<BCRec> const& h_bcrec)
+{
+    // 0 = no limiting
+    // 1 = ordered heuristic
+    // 2 = symmetric heuristic
+    int bds_limiter_type = 2;
+
+    // Define container for the nodal interpolated state
+    Box const& ngbx = amrex::grow(amrex::convert(bx,IntVect(AMREX_D_DECL(1,1,1))),1);
+    FArrayBox tmpnodefab(ngbx,1,The_Async_Arena());
+    auto const& sint = tmpnodefab.array();
+
+    Box const& gbx = amrex::grow(bx,1);
+    GpuArray<Real, AMREX_SPACEDIM> dx = geom.CellSizeArray();
+
+    Real hx = dx[0];
+    Real hy = dx[1];
+
+    Box const& domain = geom.Domain();
+    const auto dlo = amrex::lbound(domain);
+    const auto dhi = amrex::ubound(domain);
+
+    auto h_bc = h_bcrec.data()[icomp];
+
+    // these are the BC types where the first ghost cell represents the value ON the boundary
+    // for reflect_even, reflect_odd, and hoextrapcc, all the ghost cells are filled in with values extrapolated to the cell centers
+    bool lo_x_physbc = (h_bc.lo(0) == BCType::foextrap || h_bc.lo(0) == BCType::hoextrap || h_bc.lo(0) == BCType::ext_dir) ? true : false;
+    bool hi_x_physbc = (h_bc.hi(0) == BCType::foextrap || h_bc.hi(0) == BCType::hoextrap || h_bc.hi(0) == BCType::ext_dir) ? true : false;
+    bool lo_y_physbc = (h_bc.lo(1) == BCType::foextrap || h_bc.lo(1) == BCType::hoextrap || h_bc.lo(1) == BCType::ext_dir) ? true : false;
+    bool hi_y_physbc = (h_bc.hi(1) == BCType::foextrap || h_bc.hi(1) == BCType::hoextrap || h_bc.hi(1) == BCType::ext_dir) ? true : false;
+
+    // bicubic interpolation to corner points
+    // (i,j,k) refers to lower corner of cell
+    // Added k index -- placeholder for 2d
+    ParallelFor(ngbx, [=] AMREX_GPU_DEVICE (int i, int j, int k){
+
+        // set node values equal to the average of the ghost cell values since they store the physical condition on the boundary
+        if ( i<=dlo.x && lo_x_physbc ) {
+            sint(i,j,k) = Real(0.5)*(s(dlo.x-1,j,k,icomp) + s(dlo.x-1,j-1,k,icomp));
+            return;
+        }
+        if ( i>=dhi.x+1 && hi_x_physbc ) {
+            sint(i,j,k) = Real(0.5)*(s(dhi.x+1,j,k,icomp) + s(dhi.x+1,j-1,k,icomp));
+            return;
+        }
+        if ( j<=dlo.y && lo_y_physbc ) {
+            sint(i,j,k) = Real(0.5)*(s(i,dlo.y-1,k,icomp) + s(i-1,dlo.y-1,k,icomp));
+            return;
+        }
+        if ( j>=dhi.y+1 && hi_y_physbc ) {
+            sint(i,j,k) = Real(0.5)*(s(i,dhi.y+1,k,icomp) + s(i-1,dhi.y+1,k,icomp));
+            return;
+        }
+
+        // one cell inward from any boundary where the ghost cells represents the value ON the boundary, revert to 4-point average
+        if ( (i==dlo.x+1 && lo_x_physbc) ||
+             (i==dhi.x   && hi_x_physbc) ||
+             (j==dlo.y+1 && lo_y_physbc) ||
+             (j==dhi.y   && hi_y_physbc) ) {
+
+            sint(i,j,k) = Real(0.25)* (s(i,j,k,icomp) + s(i-1,j,k,icomp) + s(i,j-1,k,icomp) + s(i-1,j-1,k,icomp));
+            return;
+        }
+
+        sint(i,j,k) = (s(i-2,j-2,k,icomp) + s(i-2,j+1,k,icomp) + s(i+1,j-2,k,icomp) + s(i+1,j+1,k,icomp)
+                - Real(7)*(s(i-2,j-1,k,icomp) + s(i-2,j  ,k,icomp) + s(i-1,j-2,k,icomp) + s(i  ,j-2,k,icomp) +
+                           s(i-1,j+1,k,icomp) + s(i  ,j+1,k,icomp) + s(i+1,j-1,k,icomp) + s(i+1,j  ,k,icomp))
+               + Real(49)*(s(i-1,j-1,k,icomp) + s(i  ,j-1,k,icomp) + s(i-1,j  ,k,icomp) + s(i  ,j  ,k,icomp)) ) / Real(144);
+    });
+
+    ParallelFor(gbx, [=] AMREX_GPU_DEVICE (int i, int j, int k){
+        // compute initial estimates of slopes from unlimited corner points
+
+        // local variables
+        Real sumloc, redfac, redmax, div, kdp, sumdif, sgndif;
+
+        Array1D<Real, 1, 4> diff;
+        Array1D<Real, 1, 4> smin;
+        Array1D<Real, 1, 4> smax;
+        Array1D<Real, 1, 4> sc;
+
+        // compute initial estimates of slopes from unlimited corner points
+        // sx
+        slopes(i,j,k,0) = Real(0.5)*(sint(i+1,j+1,k) + sint(i+1,j,k) - sint(i,j+1,k) - sint(i,j,k)) / hx;
+        // sy
+        slopes(i,j,k,1) = Real(0.5)*(sint(i+1,j+1,k) - sint(i+1,j,k) + sint(i,j+1,k) - sint(i,j,k)) / hy;
+        // sxy
+        slopes(i,j,k,2) =     (sint(i+1,j+1,k) - sint(i+1,j,k) - sint(i,j+1,k) + sint(i,j,k)) / (hx*hy);
+
+        if (bds_limiter_type > 0) {
+
+            // ++ / sint(i+1,j+1)
+            sc(4) = s(i,j,k,icomp) + Real(0.5)*(hx*slopes(i,j,k,0) + hy*slopes(i,j,k,1)) + Real(0.25)*hx*hy*slopes(i,j,k,2);
+
+            // +- / sint(i+1,j  )
+            sc(3) = s(i,j,k,icomp) + Real(0.5)*(hx*slopes(i,j,k,0) - hy*slopes(i,j,k,1)) - Real(0.25)*hx*hy*slopes(i,j,k,2);
+
+            // -+ / sint(i  ,j+1)
+            sc(2) = s(i,j,k,icomp) - Real(0.5)*(hx*slopes(i,j,k,0) - hy*slopes(i,j,k,1)) - Real(0.25)*hx*hy*slopes(i,j,k,2);
+
+            // -- / sint(i  ,j  )
+            sc(1) = s(i,j,k,icomp) - Real(0.5)*(hx*slopes(i,j,k,0) + hy*slopes(i,j,k,1)) + Real(0.25)*hx*hy*slopes(i,j,k,2);
+
+            // enforce max/min bounds
+            smin(4) = amrex::min(s(i,j,k,icomp), s(i+1,j,k,icomp), s(i,j+1,k,icomp), s(i+1,j+1,k,icomp));
+            smax(4) = amrex::max(s(i,j,k,icomp), s(i+1,j,k,icomp), s(i,j+1,k,icomp), s(i+1,j+1,k,icomp));
+
+            smin(3) = amrex::min(s(i,j,k,icomp), s(i+1,j,k,icomp), s(i,j-1,k,icomp), s(i+1,j-1,k,icomp));
+            smax(3) = amrex::max(s(i,j,k,icomp), s(i+1,j,k,icomp), s(i,j-1,k,icomp), s(i+1,j-1,k,icomp));
+
+            smin(2) = amrex::min(s(i,j,k,icomp), s(i-1,j,k,icomp), s(i,j+1,k,icomp), s(i-1,j+1,k,icomp));
+            smax(2) = amrex::max(s(i,j,k,icomp), s(i-1,j,k,icomp), s(i,j+1,k,icomp), s(i-1,j+1,k,icomp));
+
+            smin(1) = amrex::min(s(i,j,k,icomp), s(i-1,j,k,icomp), s(i,j-1,k,icomp), s(i-1,j-1,k,icomp));
+            smax(1) = amrex::max(s(i,j,k,icomp), s(i-1,j,k,icomp), s(i,j-1,k,icomp), s(i-1,j-1,k,icomp));
+
+            for(int mm=1; mm<=4; ++mm){
+                sc(mm) = amrex::max(amrex::min(sc(mm), smax(mm)), smin(mm));
+            }
+
+            // Tolerance used below to decide which corners take part in the
+            // redistribution of sumdif. It has to scale with the local state: a
+            // fixed tolerance in state units switches the redistribution off
+            // altogether for a field whose local variation is at or below that
+            // value, which then leaves the corner values inconsistent with the
+            // cell average and lets them overshoot smin/smax.
+            const Real smin_all = amrex::min(smin(1),smin(2),smin(3),smin(4));
+            const Real smax_all = amrex::max(smax(1),smax(2),smax(3),smax(4));
+            const Real tol = eps * amrex::max(smax_all - smin_all,
+                                              amrex::Math::abs(s(i,j,k,icomp)),
+                                              std::numeric_limits<Real>::min());
+
+            // iterative loop
+            for(int ll=1; ll<=3; ++ll){
+
+               // compute the amount by which the average of the nodal values differs from cell-center value
+               sumloc = Real(0.25)*(sc(4) + sc(3) + sc(2) + sc(1));
+               sumdif = (sumloc - s(i,j,k,icomp))*Real(4);
+
+               // sgndif = +(-)1 if the node average is too large(small)
+               sgndif = std::copysign(Real(1),sumdif);
+
+               // compute how much each node is larger(smaller) than the cell-centered value
+               for(int mm=1; mm<=4; ++mm){
+                  diff(mm) = (sc(mm) - s(i,j,k,icomp))*sgndif;
+               }
+
+               kdp = 0;
+
+               // count how many nodes are larger(smaller) than the cell-centered value
+               for(int mm=1; mm<=4; ++mm){
+                  if (diff(mm) > tol) {
+                     kdp = kdp+1;
+                  }
+               }
+
+               if (bds_limiter_type == 1) {
+
+                   // ordered heuristic limiting
+                   for(int mm=1; mm<=4; ++mm){
+
+                       // how many node values are left to potentially adjust
+                       if (kdp<1) {
+                           div = Real(1);
+                       } else {
+                           div = kdp;
+                       }
+
+                       // if the node needs adjusting, figure out by how much the remaining sum is divy'ed up
+                       if (diff(mm)>tol) {
+                           redfac = sumdif*sgndif/div;
+                           kdp = kdp-1;
+                       } else {
+                           redfac = Real(0.0);
+                       }
+
+                       // don't let the adjustment introduce any new extrema
+                       if (sgndif > Real(0.0)) {
+                           redmax = sc(mm) - smin(mm);
+                       } else {
+                           redmax = smax(mm) - sc(mm);
+                       }
+                       redfac = amrex::min(redfac,redmax);
+
+                       // adjust nodal value and decrement the excess
+                       sumdif = sumdif - redfac*sgndif;
+                       sc(mm) = sc(mm) - redfac*sgndif;
+                   }
+
+               } else if (bds_limiter_type == 2) {
+
+                   // symmetric heuristic limiting
+                   for(int mm=1; mm<=4; ++mm){
+
+                       div = kdp;
+
+                       if (diff(mm)>tol) {
+                           redfac = sumdif*sgndif/div;
+                       } else {
+                           redfac = Real(0.0);
+                       }
+
+                       if (sgndif > Real(0.0)) {
+                           redmax = sc(mm) - smin(mm);
+                       } else {
+                           redmax = smax(mm) - sc(mm);
+                       }
+
+                       redfac = amrex::min(redfac,redmax);
+                       sc(mm) = sc(mm) - redfac*sgndif;
+                   }
+
+               }
+            }
+
+            // final slopes
+            // sx
+            slopes(i,j,k,0) = Real(0.5)*( sc(4) + sc(3) -sc(1) - sc(2) )/hx;
+            // sy
+            slopes(i,j,k,1) = Real(0.5)*( sc(4) + sc(2) -sc(1) - sc(3) )/hy;
+            // sxy
+            slopes(i,j,k,2) =     ( sc(1) + sc(4) -sc(2) - sc(3) )/(hx*hy);
+        }
+    });
+}
+
+/**
+ * Returns updated edge value.
+ *
+ * \param [in] s
+ * \param [in] slope
+ * \param [in] del
+ *
+ *
+ */
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+Real eval (const Real s,
+           Array1D<Real,1,3>& slope,
+           Array1D<Real,1,2>& del)
+{
+    Real val = s + del(1)*slope(1) + del(2)*slope(2) + del(1)*del(2)*slope(3);
+
+    return val;
+}
+
+/**
+ * Compute Conc for BDS algorithm.
+ *
+ * \param [in]     bx          Current grid patch
+ * \param [in]     geom        Level geometry.
+ * \param [in]     icomp       Component of the Array4s.
+ * \param [in]     s           Array4 of state.
+ * \param [in,out] sedgex      Array4 containing x-edges.
+ * \param [in,out] sedgey      Array4 containing y-edges.
+ * \param [in]     slopes      Array4 containing slope information.
+ * \param [in]     umac        Array4 for u-face velocity.
+ * \param [in]     vmac        Array4 for v-face velocity.
+ * \param [in]     force       Array4 for forces.
+ * \param [in]     iconserv    Indicates conservative dimensions.
+ * \param [in]     dt          Time step.
+ * \param [in]     h_bcrec     Boundary conditions (host).
+ * \param [in]     pbc         Boundary conditions (device).
+ * \param [in]     is_velocity Indicates a component is velocity so boundary conditions can
+ *                             be properly addressed. The header hydro_constants.H
+ *                             defines the component position by [XY]VEL macro.
+ *
+ */
+
+void
+BDS::ComputeConc (Box const& bx,
+                  const Geometry& geom,
+                  int icomp,
+                  Array4<Real const> const& s,
+                  Array4<Real      > const& sedgex,
+                  Array4<Real      > const& sedgey,
+                  Array4<Real const> const& slopes,
+                  Array4<Real const> const& umac,
+                  Array4<Real const> const& vmac,
+                  Array4<Real const> const& divu,
+                  Array4<Real const> const& force,
+                  int const* iconserv,
+                  Real dt,
+                  Vector<BCRec> const& h_bcrec,
+                  BCRec const* pbc,
+                  bool is_velocity,
+                  bool allow_inflow_on_outflow)
+{
+    Box const& gbx = amrex::grow(bx,1);
+    GpuArray<Real, AMREX_SPACEDIM> dx = geom.CellSizeArray();
+
+    FArrayBox ux_fab(gbx,1,The_Async_Arena());
+    FArrayBox vy_fab(gbx,1,The_Async_Arena());
+    auto const& ux    = ux_fab.array();
+    auto const& vy    = vy_fab.array();
+
+    Real hx = dx[0];
+    Real hy = dx[1];
+
+    Real dt2 = dt/Real(2);
+    Real dt3 = dt/Real(3);
+
+    // 2D axisymmetric geometry. The divergence of the radial velocity is
+    // (1/r) d(r u)/dr, and a radial flux carries the area of its own face.
+    const bool is_rz = geom.IsRZ();
+    const Real problo_x = geom.ProbLo(0);
+
+    Box const& domain = geom.Domain();
+    const auto dlo = amrex::lbound(domain);
+    const auto dhi = amrex::ubound(domain);
+
+    auto h_bc = h_bcrec.data()[icomp];
+    bool lo_x_physbc = (h_bc.lo(0) == BCType::foextrap || h_bc.lo(0) == BCType::hoextrap || h_bc.lo(0) == BCType::ext_dir) ? true : false;
+    bool hi_x_physbc = (h_bc.hi(0) == BCType::foextrap || h_bc.hi(0) == BCType::hoextrap || h_bc.hi(0) == BCType::ext_dir) ? true : false;
+    bool lo_y_physbc = (h_bc.lo(1) == BCType::foextrap || h_bc.lo(1) == BCType::hoextrap || h_bc.lo(1) == BCType::ext_dir) ? true : false;
+    bool hi_y_physbc = (h_bc.hi(1) == BCType::foextrap || h_bc.hi(1) == BCType::hoextrap || h_bc.hi(1) == BCType::ext_dir) ? true : false;
+
+    // compute cell-centered ux, vy
+    //
+    // In RZ, ux holds (1/r) d(r u)/dr rather than du/dr. Both of its uses want that
+    // form: the conservative x-predictor, because the conservative update is in RZ
+    // divergence form, and the convective y-predictor, because it has to cancel the
+    // r-weighted transverse terms of the y-predictor. vy is unchanged, since r does
+    // not vary along a z-face.
+    ParallelFor(gbx, [=] AMREX_GPU_DEVICE (int i, int j, int k){
+        if (is_rz) {
+            const Real r_lo = problo_x +  Real(i)            * hx;
+            const Real r_hi = problo_x + (Real(i) + Real(1)) * hx;
+            const Real r_cc = problo_x + (Real(i) + Real(0.5)) * hx;
+            ux(i,j,k) = (r_hi*umac(i+1,j,k) - r_lo*umac(i,j,k)) / (r_cc * hx);
+        } else {
+            ux(i,j,k) = (umac(i+1,j,k) - umac(i,j,k)) / hx;
+        }
+        vy(i,j,k) = (vmac(i,j+1,k) - vmac(i,j,k)) / hy;
+    });
+
+    // compute sedgex on x-faces
+    Box const& xbx = amrex::surroundingNodes(bx,0);
+    ParallelFor(xbx, [=] AMREX_GPU_DEVICE (int i, int j, int k){
+
+        auto bc = pbc[icomp];
+
+        // set edge values equal to the ghost cell value since they store the physical condition on the boundary
+        if ( i==dlo.x && lo_x_physbc ) {
+            sedgex(i,j,k,icomp) = s(i-1,j,k,icomp);
+            if (!allow_inflow_on_outflow && is_velocity && icomp == XVEL && (bc.lo(0) == BCType::foextrap || bc.lo(0) == BCType::hoextrap) ) {
+                // make sure velocity is not blowing inward
+                sedgex(i,j,k,icomp) = amrex::min(0._rt,sedgex(i,j,k,icomp));
+            }
+            // This will return from computing (i,j,k), not exit from ComputeConc.
+            // Recall that ParallelFor is a macro that sets up a multidimensional loop
+            // and then calls this lambda on the loop interior.
+            return;
+        }
+        if ( i==dhi.x+1 && hi_x_physbc ) {
+            sedgex(i,j,k,icomp) = s(i,j,k,icomp);
+            if (!allow_inflow_on_outflow && is_velocity && icomp == XVEL && (bc.hi(0) == BCType::foextrap || bc.hi(0) == BCType::hoextrap) ) {
+                // make sure velocity is not blowing inward
+                sedgex(i,j,k,icomp) = amrex::max(0._rt,sedgex(i,j,k,icomp));
+            }
+            return;
+        }
+
+        // local variables
+        Array1D<Real, 1, 2> del;
+        Array1D<Real, 1, 2> p1;
+        Array1D<Real, 1, 2> p2;
+        Array1D<Real, 1, 2> p3;
+
+        Array1D<Real, 1, 3> slope_tmp;
+
+        int ioff, joff;
+        Real isign,jsign;
+        Real val1,val2,val3;
+        Real u;
+        Real gamma;
+
+        // Since faces of xbx can overlap between tileboxes, need a temporary
+        // to hold intermediate edgestate value
+        Real xedge_tmp;
+
+        ///////////////////////////////////////////////
+        // compute sedgex without transverse corrections
+        ///////////////////////////////////////////////
+
+        if (umac(i,j,k) > 0) {
+            isign = Real(1);
+            ioff = -1;
+        } else {
+            isign = -Real(1);
+            ioff = 0;
+        }
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i+ioff,j,k,n-1);
+        }
+
+        // centroid of rectangular volume
+        del(1) = isign*Real(0.5)*hx - Real(0.5)*umac(i,j,k)*dt;
+        del(2) = Real(0.);
+        xedge_tmp = eval(s(i+ioff,j,k,icomp),slope_tmp,del);
+
+        // source term
+        if (iconserv[icomp]) {
+            xedge_tmp = xedge_tmp*(Real(1)- dt2*ux(i+ioff,j,k));
+        } else {
+            xedge_tmp = xedge_tmp*(Real(1)+ dt2*vy(i+ioff,j,k));
+        }
+        if (force) {
+            xedge_tmp += dt2*force(i+ioff,j,k,icomp);
+        }
+
+        ///////////////////////////////////////////////
+        // compute \Gamma^{y+}
+        ///////////////////////////////////////////////
+
+        if (vmac(i+ioff,j+1,k) > Real(0.)) {
+            jsign = Real(1);
+            joff = 0;
+        } else {
+            jsign = -Real(1);
+            joff = 1;
+        }
+
+        u = Real(0.);
+        if (umac(i,j,k)*umac(i,j+joff,k) > Real(0.)) {
+            u = umac(i,j+joff,k);
+        }
+
+        p1(1) = isign*Real(0.5)*hx;
+        p1(2) = jsign*Real(0.5)*hy;
+
+        p2(1) = isign*Real(0.5)*hx - umac(i,j,k)*dt;
+        p2(2) = jsign*Real(0.5)*hy;
+
+        p3(1) = isign*Real(0.5)*hx - u*dt;
+        p3(2) = jsign*Real(0.5)*hy - vmac(i+ioff,j+1,k)*dt;
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i+ioff,j+joff,k,n-1);
+        }
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p2(ll)+p3(ll))/Real(2);
+        }
+        val1 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p3(ll))/Real(2);
+        }
+        val2 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p2(ll))/Real(2);
+        }
+        val3 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        // average these centroid values to get the average value
+        gamma = (val1+val2+val3)/Real(3);
+
+        // source term
+        if (iconserv[icomp]) {
+            AMREX_ASSERT(divu);
+            gamma = gamma*(Real(1)- dt3*divu(i+ioff,j+joff,k));
+        }
+
+        ///////////////////////////////////////////////
+        // correct sedgex with \Gamma^{y+}
+        ///////////////////////////////////////////////
+
+        gamma = gamma * vmac(i+ioff,j+1,k);
+
+        xedge_tmp = xedge_tmp - dt*gamma/(Real(2)*hy);
+
+        ///////////////////////////////////////////////
+        // compute \Gamma^{y-}
+        ///////////////////////////////////////////////
+
+        if (vmac(i+ioff,j,k) > Real(0.)) {
+            jsign = Real(1);
+            joff = -1;
+        } else {
+            jsign = -Real(1);
+            joff = 0;
+                }
+
+        u = Real(0.);
+        if (umac(i,j,k)*umac(i,j+joff,k) > Real(0.)) {
+            u = umac(i,j+joff,k);
+        }
+
+        p1(1) = isign*Real(0.5)*hx;
+        p1(2) = jsign*Real(0.5)*hy;
+
+        p2(1) = isign*Real(0.5)*hx - umac(i,j,k)*dt;
+        p2(2) = jsign*Real(0.5)*hy;
+
+        p3(1) = isign*Real(0.5)*hx - u*dt;
+        p3(2) = jsign*Real(0.5)*hy - vmac(i+ioff,j,k)*dt;
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i+ioff,j+joff,k,n-1);
+        }
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p2(ll)+p3(ll))/Real(2);
+        }
+        val1 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p3(ll))/Real(2);
+        }
+        val2 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p2(ll))/Real(2);
+        }
+        val3 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        // average these centroid values to get the average value
+        gamma = (val1+val2+val3)/Real(3);
+
+        // source term
+        if (iconserv[icomp]) {
+            AMREX_ASSERT(divu);
+            gamma = gamma*(Real(1)- dt3*divu(i+ioff,j+joff,k));
+        }
+
+        ///////////////////////////////////////////////
+        // correct sedgex with \Gamma^{y-}
+        ///////////////////////////////////////////////
+
+        gamma = gamma * vmac(i+ioff,j,k);
+        sedgex(i,j,k,icomp) = xedge_tmp + dt*gamma/(Real(2)*hy);
+    });
+
+    // compute sedgey on y-faces
+    Box const& ybx = amrex::surroundingNodes(bx,1);
+    ParallelFor(ybx, [=] AMREX_GPU_DEVICE (int i, int j, int k){
+
+        auto bc = pbc[icomp];
+
+        // set edge values equal to the ghost cell value since they store the physical condition on the boundary
+        if ( j==dlo.y && lo_y_physbc ) {
+            sedgey(i,j,k,icomp) = s(i,j-1,k,icomp);
+            if (!allow_inflow_on_outflow && is_velocity && icomp == YVEL && (bc.lo(1) == BCType::foextrap || bc.lo(1) == BCType::hoextrap) ) {
+                // make sure velocity is not blowing inward
+                sedgey(i,j,k,icomp) = amrex::min(0._rt,sedgey(i,j,k,icomp));
+            }
+            return;
+        }
+        if ( j==dhi.y+1 && hi_y_physbc ) {
+            sedgey(i,j,k,icomp) = s(i,j,k,icomp);
+            if (!allow_inflow_on_outflow && is_velocity && icomp == YVEL && (bc.hi(1) == BCType::foextrap || bc.hi(1) == BCType::hoextrap) ) {
+                // make sure velocity is not blowing inward
+                sedgey(i,j,k,icomp) = amrex::max(0._rt,sedgey(i,j,k,icomp));
+            }
+            return;
+        }
+
+        // local variables
+        Array1D<Real, 1, 2> del;
+        Array1D<Real, 1, 2> p1;
+        Array1D<Real, 1, 2> p2;
+        Array1D<Real, 1, 2> p3;
+
+        Array1D<Real, 1, 3> slope_tmp;
+
+        int ioff, joff;
+        Real isign,jsign;
+        Real val1,val2,val3;
+        Real v;
+        Real gamma;
+
+        // To hold intermediate edgestate value
+        Real yedge_tmp;
+
+        // In RZ the transverse terms below are the radial flux divergence
+        // (1/r) d(r u s)/dr, so each of the two radial fluxes carries its own radius.
+        Real r_fac_lo = Real(1);
+        Real r_fac_hi = Real(1);
+        if (is_rz) {
+            const Real r_cc = problo_x + (Real(i) + Real(0.5)) * hx;
+            r_fac_lo = (problo_x +  Real(i)            * hx) / r_cc;
+            r_fac_hi = (problo_x + (Real(i) + Real(1)) * hx) / r_cc;
+        }
+
+        ///////////////////////////////////////////////
+        // compute sedgey without transverse corrections
+        ///////////////////////////////////////////////
+
+        // centroid of rectangular volume
+        if (vmac(i,j,k) > Real(0.)) {
+            jsign = Real(1);
+            joff = -1;
+        } else {
+            jsign = -Real(1);
+            joff = 0;
+        }
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i,j+joff,k,n-1);
+        }
+
+        del(1) = Real(0.);
+        del(2) = jsign*Real(0.5)*hy - Real(0.5)*vmac(i,j,k)*dt;
+        yedge_tmp = eval(s(i,j+joff,k,icomp),slope_tmp,del);
+
+        // source term
+        if (iconserv[icomp]) {
+            yedge_tmp = yedge_tmp*(Real(1)- dt2*vy(i,j+joff,k));
+        } else {
+            yedge_tmp = yedge_tmp*(Real(1)+ dt2*ux(i,j+joff,k));
+        }
+        if (force) {
+            yedge_tmp += dt2*force(i,j+joff,k,icomp);
+        }
+
+        ///////////////////////////////////////////////
+        // compute \Gamma^{x+}
+        ///////////////////////////////////////////////
+
+        if (umac(i+1,j+joff,k) > Real(0.)) {
+            isign = Real(1);
+            ioff = 0;
+        } else {
+            isign = -Real(1);
+            ioff = 1;
+        }
+
+        v = Real(0.);
+        if (vmac(i,j,k)*vmac(i+ioff,j,k) > Real(0.)) {
+            v = vmac(i+ioff,j,k);
+        }
+
+        p1(1) = isign*Real(0.5)*hx;
+        p1(2) = jsign*Real(0.5)*hy;
+
+        p2(1) = isign*Real(0.5)*hx;
+        p2(2) = jsign*Real(0.5)*hy - vmac(i,j,k)*dt;
+
+        p3(1) = isign*Real(0.5)*hx - umac(i+1,j+joff,k)*dt;
+        p3(2) = jsign*Real(0.5)*hy - v*dt;
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i+ioff,j+joff,k,n-1);
+        }
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p2(ll)+p3(ll))/Real(2);
+        }
+        val1 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p3(ll))/Real(2);
+        }
+        val2 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p2(ll))/Real(2);
+        }
+        val3 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        // average these centroid values to get the average value
+        gamma = (val1+val2+val3)/Real(3);
+
+        // source term
+        if (iconserv[icomp]) {
+            AMREX_ASSERT(divu);
+            gamma = gamma*(Real(1)- dt3*divu(i+ioff,j+joff,k));
+        }
+
+        ///////////////////////////////////////////////
+        // correct sedgey with \Gamma^{x+}
+        ///////////////////////////////////////////////
+
+        gamma = gamma * umac(i+1,j+joff,k);
+        yedge_tmp = yedge_tmp - r_fac_hi*dt*gamma/(Real(2)*hx);
+
+        ///////////////////////////////////////////////
+        // compute \Gamma^{x-}
+        ///////////////////////////////////////////////
+
+        if (umac(i,j+joff,k) > Real(0.)) {
+            isign = Real(1);
+            ioff = -1;
+        } else {
+            isign = -Real(1);
+            ioff = 0;
+        }
+
+        v = Real(0.);
+        if (vmac(i,j,k)*vmac(i+ioff,j,k) > Real(0.)) {
+            v = vmac(i+ioff,j,k);
+        }
+
+        p1(1) = isign*Real(0.5)*hx;
+        p1(2) = jsign*Real(0.5)*hy;
+
+        p2(1) = isign*Real(0.5)*hx;
+        p2(2) = jsign*Real(0.5)*hy - vmac(i,j,k)*dt;
+
+        p3(1) = isign*Real(0.5)*hx - umac(i,j+joff,k)*dt;
+        p3(2) = jsign*Real(0.5)*hy - v*dt;
+
+        for(int n=1; n<=3; ++n){
+            slope_tmp(n) = slopes(i+ioff,j+joff,k,n-1);
+        }
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p2(ll)+p3(ll))/Real(2);
+        }
+        val1 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p3(ll))/Real(2);
+        }
+        val2 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        for (int ll=1; ll<=2; ++ll) {
+            del(ll) = (p1(ll)+p2(ll))/Real(2);
+        }
+        val3 = eval(s(i+ioff,j+joff,k,icomp),slope_tmp,del);
+
+        // average these centroid values to get the average value
+        gamma = (val1+val2+val3)/Real(3);
+
+        // source term
+        if (iconserv[icomp]) {
+            AMREX_ASSERT(divu);
+            gamma = gamma*(Real(1)- dt3*divu(i+ioff,j+joff,k));
+        }
+
+        ///////////////////////////////////////////////
+        // correct sedgey with \Gamma^{x-}
+        ///////////////////////////////////////////////
+
+        gamma = gamma * umac(i,j+joff,k);
+        sedgey(i,j,k,icomp) = yedge_tmp + r_fac_lo*dt*gamma/(Real(2)*hx);
+    });
+}
+
+/** @} */
